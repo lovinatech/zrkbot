@@ -3,12 +3,13 @@ import string
 import sqlite3
 import threading
 import os
+import hashlib
+import hmac
 
-from flask import Flask
+from flask import Flask, request, redirect, url_for, session
 from flask_admin import Admin
 from flask_admin.contrib.sqla import ModelView
 from flask_sqlalchemy import SQLAlchemy
-
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from rapidfuzz import process, fuzz
@@ -25,66 +26,97 @@ pending_operator = {}
 operator_admin_to_user = {}
 
 ########################################
-# Настройка веб-панели (Flask + Admin)
+# НАСТРОЙКИ БЕЗОПАСНОСТИ
 ########################################
+SECRET_KEY = 'supersecretkey'  # Укажите более надежное значение
+CREDENTIALS_FILE = 'credentials.txt'
 
-# Инициализация Flask-приложения (база в папке database, расположенной в корне)
+def hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def save_credentials(username, password):
+    hashed_password = hash_password(password)
+    with open(CREDENTIALS_FILE, 'w') as f:
+        f.write(f"{username}:{hashed_password}")
+
+def load_credentials():
+    if not os.path.exists(CREDENTIALS_FILE):
+        return None, None
+    with open(CREDENTIALS_FILE, 'r') as f:
+        data = f.read().strip()
+        if ':' in data:
+            return data.split(':', 1)
+    return None, None
+
+def check_credentials(username, password):
+    saved_username, saved_password = load_credentials()
+    if not saved_username or not saved_password:
+        return False
+    return saved_username == username and hmac.compare_digest(saved_password, hash_password(password))
+
+########################################
+# НАСТРОЙКА ВЕБ-ПАНЕЛИ
+########################################
 web_app = Flask(__name__)
+web_app.secret_key = SECRET_KEY
 web_app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-web_app.secret_key = 'supersecretkey'  # Замените на более надёжное значение
 
-# Папка для базы данных (находится в корне проекта)
 db_folder = os.path.join(os.getcwd(), "database")
 os.makedirs(db_folder, exist_ok=True)
 db_file = os.path.join(db_folder, "faq_database.db")
 web_app.config['SQLALCHEMY_DATABASE_URI'] = f"sqlite:///{db_file}"
-
-# Инициализация SQLAlchemy
 db = SQLAlchemy(web_app)
 
-
-# Модель FAQ для административной панели
 class FAQ(db.Model):
-    __tablename__ = 'faq'
     id = db.Column(db.Integer, primary_key=True)
     question = db.Column(db.Text, unique=True, nullable=False)
     answer = db.Column(db.Text, nullable=False)
 
-    def __str__(self):
-        return self.question
-
-
-# Создание таблиц, если они отсутствуют
 with web_app.app_context():
     db.create_all()
 
-
-# Кастомное представление модели FAQ (все надписи переведены на русский, фильтры отключены)
 class FAQModelView(ModelView):
-    create_modal = False  # используем «старый» способ добавления
-    edit_modal = False  # используем «старый» способ редактирования
-    can_view_details = True
+    def is_accessible(self):
+        return session.get('logged_in')
 
-    column_labels = {
-        'id': 'ID',
-        'question': 'Вопрос',
-        'answer': 'Ответ'
-    }
-    column_searchable_list = ['question', 'answer']
-    column_sortable_list = ['id', 'question']
-    # Фильтры не используются
-
-    page_size = 20
-
-
-# Инициализация Flask-Admin (админка доступна по адресу http://localhost:5000)
 admin = Admin(web_app, name='Панель администратора FAQ', template_mode='bootstrap3')
 admin.add_view(FAQModelView(FAQ, db.session, name='FAQ'))
 
+@web_app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+        if check_credentials(username, password):
+            session['logged_in'] = True
+            return redirect(url_for('admin.index'))
+    return 'Введите логин и пароль'
 
-# Функция для запуска веб-сервера (админка доступна по адресу http://localhost:5000)
+@web_app.route('/logout')
+def logout():
+    session.pop('logged_in', None)
+    return redirect(url_for('login'))
+
+@web_app.route('/password', methods=['POST'])
+def change_password():
+    username = request.form['username']
+    new_password = request.form['new_password']
+    save_credentials(username, new_password)
+    return 'Пароль обновлен'
+
 def run_flask():
-    web_app.run(port=5000)
+    from gunicorn.app.base import BaseApplication
+    class FlaskApplication(BaseApplication):
+        def __init__(self, app, options=None):
+            self.app = app
+            self.options = options or {}
+            super().__init__()
+        def load_config(self):
+            for key, value in self.options.items():
+                self.cfg.set(key, value)
+        def load(self):
+            return self.app
+    FlaskApplication(web_app, {'bind': '127.0.0.1:8000', 'workers': 4}).run()
 
 
 ########################################
@@ -321,7 +353,6 @@ async def operator_reply_handler(client, message):
 ########################################
 
 if __name__ == "__main__":
-    # Запускаем веб-панель в отдельном потоке (админка доступна по адресу http://localhost:5000)
     flask_thread = threading.Thread(target=run_flask)
     flask_thread.daemon = True
     flask_thread.start()
