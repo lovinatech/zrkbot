@@ -3,13 +3,14 @@ import string
 import sqlite3
 import threading
 import os
-import hashlib
-import hmac
 
-from flask import Flask, request, redirect, url_for, session
+from flask import Flask
 from flask_admin import Admin
 from flask_admin.contrib.sqla import ModelView
 from flask_sqlalchemy import SQLAlchemy
+from flask_basicauth import BasicAuth
+from waitress import serve
+
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from rapidfuzz import process, fuzz
@@ -26,98 +27,68 @@ pending_operator = {}
 operator_admin_to_user = {}
 
 ########################################
-# НАСТРОЙКИ БЕЗОПАСНОСТИ
+# Настройка веб-панели (Flask + Admin)
 ########################################
-SECRET_KEY = 'supersecretkey'  # Укажите более надежное значение
-CREDENTIALS_FILE = 'credentials.txt'
 
-def hash_password(password):
-    return hashlib.sha256(password.encode()).hexdigest()
-
-def save_credentials(username, password):
-    hashed_password = hash_password(password)
-    with open(CREDENTIALS_FILE, 'w') as f:
-        f.write(f"{username}:{hashed_password}")
-
-def load_credentials():
-    if not os.path.exists(CREDENTIALS_FILE):
-        return None, None
-    with open(CREDENTIALS_FILE, 'r') as f:
-        data = f.read().strip()
-        if ':' in data:
-            return data.split(':', 1)
-    return None, None
-
-def check_credentials(username, password):
-    saved_username, saved_password = load_credentials()
-    if not saved_username or not saved_password:
-        return False
-    return saved_username == username and hmac.compare_digest(saved_password, hash_password(password))
-
-########################################
-# НАСТРОЙКА ВЕБ-ПАНЕЛИ
-########################################
+# Инициализация Flask-приложения (база в папке database, расположенной в корне)
 web_app = Flask(__name__)
-web_app.secret_key = SECRET_KEY
 web_app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+web_app.secret_key = 'supersecretkey'  # Замените на более надёжное значение
 
+# Настройка базовой аутентификации для админ-панели
+web_app.config['BASIC_AUTH_USERNAME'] = 'admin'
+web_app.config['BASIC_AUTH_PASSWORD'] = 'faqIHf4u8sdfj'
+web_app.config['BASIC_AUTH_FORCE'] = True  # Принудительно защищаем все маршруты
+
+basic_auth = BasicAuth(web_app)
+
+# Папка для базы данных (находится в корне проекта)
 db_folder = os.path.join(os.getcwd(), "database")
 os.makedirs(db_folder, exist_ok=True)
 db_file = os.path.join(db_folder, "faq_database.db")
 web_app.config['SQLALCHEMY_DATABASE_URI'] = f"sqlite:///{db_file}"
+
+# Инициализация SQLAlchemy
 db = SQLAlchemy(web_app)
 
+# Модель FAQ для административной панели
 class FAQ(db.Model):
+    __tablename__ = 'faq'
     id = db.Column(db.Integer, primary_key=True)
     question = db.Column(db.Text, unique=True, nullable=False)
     answer = db.Column(db.Text, nullable=False)
 
+    def __str__(self):
+        return self.question
+
+# Создание таблиц, если они отсутствуют
 with web_app.app_context():
     db.create_all()
 
+# Кастомное представление модели FAQ (все надписи переведены на русский, фильтры отключены)
 class FAQModelView(ModelView):
-    def is_accessible(self):
-        return session.get('logged_in')
+    create_modal = False  # используем «старый» способ добавления
+    edit_modal = False    # используем «старый» способ редактирования
+    can_view_details = True
 
+    column_labels = {
+        'id': 'ID',
+        'question': 'Вопрос',
+        'answer': 'Ответ'
+    }
+    column_searchable_list = ['question', 'answer']
+    column_sortable_list = ['id', 'question']
+    # Фильтры не используются
+
+    page_size = 20
+
+# Инициализация Flask-Admin (админка доступна по адресу http://zrkbot.ru)
 admin = Admin(web_app, name='Панель администратора FAQ', template_mode='bootstrap3')
 admin.add_view(FAQModelView(FAQ, db.session, name='FAQ'))
 
-@web_app.route('/login', methods=['GET', 'POST'])
-def login():
-    if request.method == 'POST':
-        username = request.form['username']
-        password = request.form['password']
-        if check_credentials(username, password):
-            session['logged_in'] = True
-            return redirect(url_for('admin.index'))
-    return 'Введите логин и пароль'
-
-@web_app.route('/logout')
-def logout():
-    session.pop('logged_in', None)
-    return redirect(url_for('login'))
-
-@web_app.route('/password', methods=['POST'])
-def change_password():
-    username = request.form['username']
-    new_password = request.form['new_password']
-    save_credentials(username, new_password)
-    return 'Пароль обновлен'
-
+# Функция для запуска production‑WSGI сервера с помощью Waitress
 def run_flask():
-    from gunicorn.app.base import BaseApplication
-    class FlaskApplication(BaseApplication):
-        def __init__(self, app, options=None):
-            self.app = app
-            self.options = options or {}
-            super().__init__()
-        def load_config(self):
-            for key, value in self.options.items():
-                self.cfg.set(key, value)
-        def load(self):
-            return self.app
-    FlaskApplication(web_app, {'bind': '127.0.0.1:8000', 'workers': 4}).run()
-
+    serve(web_app, host="0.0.0.0", port=5000)
 
 ########################################
 # Функции для обработки вопросов FAQ
@@ -128,22 +99,18 @@ def search_normalize(text):
     translator = str.maketrans('', '', string.punctuation)
     return text.translate(translator).lower().strip()
 
-
 # Нормализация отображаемого текста (удаление лишних пробелов)
 def display_normalize(text):
     return text.strip()
-
 
 # Извлечение кодов из текста (слова, содержащие буквы и цифры)
 def extract_candidate_codes(text):
     pattern = r'\b(?=\w*[A-Za-z])(?=\w*\d)\w+\b'
     return re.findall(pattern, text)
 
-
 # Проверка, является ли ответ ссылкой на .mp4
 def is_mp4_link(text):
     return bool(re.fullmatch(r'https?://\S+\.mp4', text.strip()))
-
 
 # Загрузка FAQ-данных из базы
 def load_faq_data():
@@ -158,7 +125,6 @@ def load_faq_data():
     conn.close()
     return data
 
-
 # Подготовка структур данных для поиска
 def get_faq_mappings():
     faq_data = load_faq_data()
@@ -166,7 +132,6 @@ def get_faq_mappings():
     norm_to_orig = {search_normalize(q): q for q in faq_dict.keys()}
     normalized_questions = list(norm_to_orig.keys())
     return faq_dict, norm_to_orig, normalized_questions
-
 
 # Поиск по FAQ (без учета регистра)
 def search_faq(query, threshold=75):
@@ -217,7 +182,6 @@ def search_faq(query, threshold=75):
     print("❌ Ничего не найдено")
     return None, None, None
 
-
 ########################################
 # Telegram-бот на Pyrogram
 ########################################
@@ -229,12 +193,6 @@ app_bot = Client(
     bot_token="7790967506:AAGzDLB6apodMF_RTZQsHeCmZ_6L0GDch4Y"
 )
 
-# @app_bot.on_message()
-# async def operator_request_handler(client, message):
-#     print(message)
-
-
-
 # Обработчик вызова оператора по callback (при нажатии на кнопку)
 @app_bot.on_callback_query(filters.regex("call_operator"))
 async def call_operator_callback(client, callback_query):
@@ -244,12 +202,9 @@ async def call_operator_callback(client, callback_query):
         return
     # Регистрируем запрос: значение None означает, что оператор вызван, но сообщение еще не получено
     pending_operator[user_id] = None
-    await callback_query.answer("Оператор вызван. Пожалуйста, еще раз подробно опишите проблему и приложите скриншот (если нужно)",
-                                show_alert=True)
+    await callback_query.answer("Оператор вызван. Пожалуйста, еще раз подробно опишите проблему и приложите скриншот (если нужно)", show_alert=True)
     await client.send_message(callback_query.from_user.id,
                               "Оператор вызван. Пожалуйста, еще раз подробно опишите проблему и приложите скриншот (если нужно)")
-
-
 
 # Обработчик сообщений от пользователей, находящихся в диалоге с оператором.
 # Группа 0 – имеет приоритет и обрабатывает обращения оператору.
@@ -268,10 +223,8 @@ async def operator_request_handler(client, message):
             operator_admin_to_user[forwarded_msg.id] = user_id
             await client.send_message(user_id, "Ваше обращение отправлено операторам. Ожидайте ответа.")
         else:
-            await client.send_message(user_id,
-                                      "Ваше обращение уже отправлено. Пожалуйста, ожидайте ответа от оператора.")
+            await client.send_message(user_id, "Ваше обращение уже отправлено. Пожалуйста, ожидайте ответа от оператора.")
         return  # Не обрабатываем сообщение как обычный запрос
-
 
 # Основной обработчик FAQ-запросов.
 # Группа 1 – обрабатывает сообщения, если пользователь не находится в диалоге с оператором.
@@ -321,7 +274,6 @@ async def handle_question(client, message):
             ])
         )
 
-
 @app_bot.on_message(filters.command("start") & filters.private)
 async def start(client, message):
     await message.reply_text(
@@ -330,7 +282,6 @@ async def start(client, message):
         "Например: напишите \"Ошибка APK36651065\" или просто код \"APK36651065\".\n\n"
         "Если вам не подходит автоматический ответ, нажмите кнопку «Вызвать оператора»."
     )
-
 
 # Обработчик ответов операторов.
 # Если администратор в ADMIN_CHAT_ID отвечает (reply) на сообщение, пересланное ботом, ответ отправляется пользователю и диалог закрывается.
@@ -353,6 +304,7 @@ async def operator_reply_handler(client, message):
 ########################################
 
 if __name__ == "__main__":
+    # Запускаем веб-панель в отдельном потоке (админка доступна по адресу http://zrkbot.ru)
     flask_thread = threading.Thread(target=run_flask)
     flask_thread.daemon = True
     flask_thread.start()
